@@ -1,0 +1,11 @@
+{
+  "name": "ar-pfm-guides",
+  "private": true,
+  "description": "Generators for the AR-PFM method guides (.docx, RMIT HSW style)",
+  "scripts": {
+    "build": "node cypher_guide.js ../AR-PFM_CypherES_Method_Guide.docx && node icon_guide.js ../AR-PFM_DimensionIcon_Method_Guide.docx"
+  },
+  "dependencies": {
+    "docx": "^9.7.2"
+  }
+}

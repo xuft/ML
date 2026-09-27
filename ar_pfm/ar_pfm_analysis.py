@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Angle-resolved PFM (AR-PFM) reconstruction for Asylum Research Cypher data.
+"""Angle-resolved PFM (AR-PFM) reconstruction for Asylum Cypher and Bruker Icon data.
 
 The sample is physically rotated by a set of angles theta_k relative to the
 cantilever, and lateral PFM (LPFM, and optionally vertical PFM, VPFM) images are
 acquired at each orientation with an unchanged Scan Angle. This script:
 
-1. loads the images (Asylum .ibw via ``igor2``, or .npz exports),
+1. loads the images (Asylum .ibw via ``igor2``, Bruker NanoScope .spm/.000,
+   or .npz exports),
 2. projects amplitude/phase onto a fixed lock-in reference phase (X signal),
 3. registers every image back onto the 0 deg frame (rotation + translation,
    refined from the Height channel, so the *measured* rotation is used),
@@ -14,8 +15,11 @@ acquired at each orientation with an unchanged Scan Angle. This script:
 5. returns the in-plane response magnitude, in-plane angle, the rotation-
    invariant background c, fit quality, and the VPFM buckling consistency check.
 
-Angle convention: display frame (row 0 at the top), x to the right, y up,
-angles counter-clockwise from +x. psi_raw is the fitted in-plane angle before
+Angle convention: image-array frame (row 0 at the top), x to the right, y up,
+angles counter-clockwise from +x. Manifest angles are the physical rotations
+(counter-clockwise viewed from above); with ``--angle-sign auto`` the script
+detects whether the image array is mirrored relative to that sense and reports
+it as ``angle_sign`` (-1: mirrored; report psi with handedness -1). psi_raw is the fitted in-plane angle before
 calibration; psi = handedness * psi_raw + angle_offset, with both constants
 obtained from a reference of known in-plane polarisation (``calibrate``).
 
@@ -24,7 +28,8 @@ Sub-commands
 channels   list channel labels and note keys in a data file
 run        full reconstruction from a manifest CSV
 calibrate  derive handedness / angle offset from reference ROIs
-selftest   synthetic end-to-end test of the pipeline (npz path only)
+selftest   synthetic end-to-end test (npz path, and NanoScope path with a
+           mirrored frame; the .ibw reader is not covered)
 
 Manifest CSV columns: ``angle_deg, lpfm_file`` and optionally ``vpfm_file``
 (blank if VPFM was acquired in the same file or not at all) and ``role``
@@ -36,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,7 +56,8 @@ from scipy import ndimage, optimize  # noqa: E402
 
 LOG = logging.getLogger("ar_pfm")
 
-# Scan-geometry keys in the Asylum wave note that must agree across all files.
+# Scan-geometry keys that must agree across all files (Asylum note names; the
+# NanoScope reader maps its header onto the same names).
 GEOMETRY_KEYS = ("ScanSize", "ScanPoints", "ScanLines", "ScanAngle")
 # Keys that should agree; a mismatch is reported but not fatal.
 SOFT_KEYS = ("DriveFrequency", "DriveAmplitude", "SetPoint", "ScanRate")
@@ -123,6 +130,113 @@ def load_ibw(path: Path) -> ScanFile:
     return ScanFile(path, channels, _parse_note(wave.get("note", b"")))
 
 
+_NS_ZSCALE = re.compile(
+    r"^\S+\s+(?:\[([^\]]+)\]\s+)?\(\s*(-?[\d.eE+-]+)[^)]*\)\s+(-?[\d.eE+-]+)\s*(\S*)"
+)
+_NS_SOFT = re.compile(r"^\S+\s+(-?[\d.eE+-]+)\s*(\S*)")
+_NS_NAME = re.compile(r'^\S+\s+\[([^\]]*)\]\s+"([^"]*)"')
+
+
+def _ns_sections(path: Path) -> list[tuple[str, dict[str, str]]]:
+    """Parse a NanoScope text header into (section name, {key: value}) pairs."""
+    with open(path, "rb") as fh:
+        if not fh.read(64).lstrip().startswith(b"\\*File list"):
+            raise ARPFMError(f"{path.name}: not a NanoScope file (no '\\*File list' header)")
+        fh.seek(0)
+        sections: list[tuple[str, dict[str, str]]] = []
+        while True:
+            line = fh.readline()
+            if not line:
+                raise ARPFMError(f"{path.name}: header has no '\\*File list end'; truncated?")
+            text = line.decode("latin-1").rstrip("\r\n").lstrip("\\")
+            if text.startswith("*"):
+                if text.strip() == "*File list end":
+                    return sections
+                sections.append((text[1:].strip(), {}))
+            elif sections and ":" in text:
+                key, sep, value = text.partition(": ")
+                if not sep:
+                    key, value = text.rstrip(":"), ""
+                sections[-1][1].setdefault(key.strip(), value.strip())
+
+
+def load_nanoscope(path: Path) -> ScanFile:
+    """Load a Bruker NanoScope image file (.spm, .000, .001, ...).
+
+    Scaling follows the common NanoScope convention (also used by pySPM):
+    value = raw * (Z-scale full-scale value / 2^(8 * bytes per pixel)) *
+    soft scale ('@Sens. ...' in the scanner or scan list). Lines are flipped so
+    the last stored line is row 0, assuming line 0 is the bottom of the
+    NanoScope display [verify on a known asymmetric feature]; a mirrored result
+    is caught by --angle-sign auto.
+    """
+    sections = _ns_sections(path)
+    size = path.stat().st_size
+    globals_: dict[str, str] = {}
+    for name, kv in sections:
+        if name != "Ciao image list":
+            for key, value in kv.items():
+                globals_.setdefault(key, value)
+    channels: dict[str, np.ndarray] = {}
+    first_image: dict[str, str] | None = None
+    for name, kv in sections:
+        if name != "Ciao image list" or "@2:Image Data" not in kv:
+            continue
+        m = _NS_NAME.match(kv["@2:Image Data"])
+        if not m:
+            raise ARPFMError(f"{path.name}: cannot parse image name '{kv['@2:Image Data']}'")
+        label = f"{m.group(2)} {kv.get('Line Direction', '')}".strip()
+        try:
+            n_lines, n_samps = int(kv["Number of lines"]), int(kv["Samps/line"])
+            offset, length = int(kv["Data offset"]), int(kv["Data length"])
+        except KeyError as exc:
+            raise ARPFMError(f"{path.name}: image '{label}' lacks header key {exc}") from exc
+        bpp = int(kv.get("Bytes/pixel", length // max(n_lines * n_samps, 1)))
+        if bpp not in (2, 4) or length != n_lines * n_samps * bpp:
+            raise ARPFMError(
+                f"{path.name}: '{label}' data length {length} != {n_lines}x{n_samps}x{bpp}"
+            )
+        if offset + length > size:
+            raise ARPFMError(f"{path.name}: '{label}' data block beyond end of file (truncated?)")
+        zm = _NS_ZSCALE.match(kv.get("@2:Z scale", ""))
+        if not zm:
+            raise ARPFMError(f"{path.name}: cannot parse Z scale for '{label}'")
+        soft_key, lsb, full = zm.group(1), float(zm.group(2)), float(zm.group(3))
+        hard = full / 2 ** (8 * bpp)
+        if not (np.isclose(lsb, hard, rtol=0.02) or np.isclose(lsb, full / 65536, rtol=0.02)):
+            LOG.warning("%s: '%s' V/LSB %.3g inconsistent with full scale %.3g V at %d B/px",
+                        path.name, label, lsb, full, bpp)
+        soft = 1.0
+        if soft_key:
+            sv = globals_.get("@" + soft_key)
+            sm = _NS_SOFT.match(sv or "")
+            if not sm:
+                raise ARPFMError(f"{path.name}: soft scale '@{soft_key}' for '{label}' not found")
+            soft = float(sm.group(1))
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            raw = np.frombuffer(fh.read(length), dtype={2: "<i2", 4: "<i4"}[bpp])
+        img = np.flipud(raw.astype(float).reshape(n_lines, n_samps)) * hard * soft
+        if label in channels:
+            n = 2
+            while f"{label} #{n}" in channels:
+                n += 1
+            LOG.warning("%s: duplicate channel '%s' stored as '%s #%d'", path.name, label, label, n)
+            label = f"{label} #{n}"
+        channels[label] = img
+        first_image = first_image or kv
+    if not channels:
+        raise ARPFMError(f"{path.name}: no image layers found")
+    note = {
+        "ScanSize": globals_.get("Scan Size", first_image.get("Scan Size")),
+        "ScanPoints": first_image.get("Samps/line"),
+        "ScanLines": first_image.get("Number of lines"),
+        "ScanAngle": globals_.get("Rotate Ang."),
+        "ScanRate": globals_.get("Scan Rate", globals_.get("Scan rate")),
+    }
+    return ScanFile(path, channels, {k: v for k, v in note.items() if v is not None})
+
+
 def load_npz(path: Path) -> ScanFile:
     """Load an .npz export: one 2-D array per channel, optional '__note__' JSON."""
     with np.load(path, allow_pickle=False) as npz:
@@ -148,6 +262,8 @@ def load_scan(path: Path) -> ScanFile:
     suffix = path.suffix.lower()
     if suffix == ".ibw":
         scan = load_ibw(path)
+    elif suffix == ".spm" or re.fullmatch(r"\.\d{3}", suffix):
+        scan = load_nanoscope(path)
     elif suffix == ".npz":
         scan = load_npz(path)
     else:
@@ -193,6 +309,11 @@ def complex_signal(amp: np.ndarray, phase_deg: np.ndarray) -> np.ndarray:
     """Lock-in output as a complex number A exp(i phi)."""
     if np.any(amp < 0):
         raise ARPFMError("Negative amplitude values: wrong channel selected?")
+    if np.nanmax(np.abs(phase_deg)) > 400:
+        raise ARPFMError(
+            "Phase values exceed 360 deg in magnitude: the phase channel is not in "
+            "degrees (wrong channel, or unscaled NanoScope data)."
+        )
     return amp * np.exp(1j * np.deg2rad(phase_deg))
 
 
@@ -301,7 +422,8 @@ class Transform:
 
 
 def register(
-    ref: np.ndarray, mov: np.ndarray, nominal_deg: float, max_dev_deg: float
+    ref: np.ndarray, mov: np.ndarray, nominal_deg: float, max_dev_deg: float,
+    quiet: bool = False,
 ) -> Transform:
     """Find rotation near -nominal and translation mapping ``mov`` onto ``ref``."""
 
@@ -331,7 +453,7 @@ def register(
     )
     if -res.fun > best.ncc:
         best = Transform(float(res.x[0]), (float(res.x[1]), float(res.x[2])), float(-res.fun))
-    if abs(best.rotation_deg - base) > max_dev_deg - 0.25:
+    if abs(best.rotation_deg - base) > max_dev_deg - 0.25 and not quiet:
         LOG.warning(
             "Best rotation %.2f deg is at the edge of the search window around "
             "%.1f deg; increase --max-angle-dev or check the nominal angle",
@@ -453,6 +575,7 @@ class Options:
     max_angle_dev: float
     signal_floor: float
     line_flatten: bool = False
+    angle_sign: int = 0  # 0 = auto-detect, +1 / -1 forced
 
 
 def read_manifest(path: Path) -> pd.DataFrame:
@@ -523,10 +646,11 @@ def run(manifest: Path, out: Path, opt: Options) -> dict:
 
     # Registration on the Height channel of every file against the 0 deg LPFM file.
     ref_h = level_height(lat_scans[0].get(opt.height), opt.line_flatten)
+    sign = detect_angle_sign(df, lat_scans, ref_h, opt)
     records = []
     lat_x, lat_y, vert_x = [], [], []
     for i, row in enumerate(df.itertuples()):
-        nominal = float(row.angle_deg)
+        nominal = sign * float(row.angle_deg)
         t_lat = register(
             ref_h, level_height(lat_scans[i].get(opt.height), opt.line_flatten),
             nominal, opt.max_angle_dev,
@@ -601,6 +725,7 @@ def run(manifest: Path, out: Path, opt: Options) -> dict:
         maps["lat_h2_ratio"] = to_map(lat_fit.h2_ratio)
 
     qc: dict = {
+        "angle_sign": sign,
         "n_orientations": int(len(fit_idx)),
         "lat_phase_ref_deg": lat_ref,
         "valid_pixels": int(mask.sum()),
@@ -653,6 +778,34 @@ def run(manifest: Path, out: Path, opt: Options) -> dict:
     (out / "ar_pfm_qc.json").write_text(json.dumps(qc, indent=2))
     plot_summary(maps, qc, out / "ar_pfm_summary.png")
     return qc
+
+
+def detect_angle_sign(df: pd.DataFrame, scans: list[ScanFile], ref_h: np.ndarray,
+                      opt: Options) -> int:
+    """Return +1 if the image array rotates with the manifest sense, -1 if mirrored.
+
+    Tries both signs at the first orientation that is not 0 or 180 deg.
+    """
+    if opt.angle_sign in (-1, 1):
+        return opt.angle_sign
+    angles = df["angle_deg"].to_numpy(float)
+    cand = [i for i, a in enumerate(angles) if not np.isclose(np.mod(a, 180.0), 0.0)]
+    if not cand:
+        LOG.info("All orientations are 0/180 deg: angle sign irrelevant, using +1")
+        return 1
+    i = cand[0]
+    mov = level_height(scans[i].get(opt.height), opt.line_flatten)
+    scores = {s: register(ref_h, mov, s * angles[i], opt.max_angle_dev, quiet=True).ncc
+              for s in (1, -1)}
+    sign = max(scores, key=scores.get)
+    if abs(scores[1] - scores[-1]) < 0.05:
+        LOG.warning("Angle sign ambiguous at %.0f deg (NCC +: %.3f, -: %.3f); featureless "
+                    "registration channel? Using %+d", angles[i], scores[1], scores[-1], sign)
+    else:
+        LOG.info("Angle sign %+d (NCC +: %.3f, -: %.3f)%s", sign, scores[1], scores[-1],
+                 "; image array mirrored relative to the physical rotation sense"
+                 if sign < 0 else "")
+    return sign
 
 
 def trace_retrace_check(scan: ScanFile, opt: Options, phase_ref: float) -> dict:
@@ -764,8 +917,37 @@ def calibrate(maps_path: Path, rois: list[tuple[int, int, int, int]], psi_true: 
 
 
 # -------------------------------------------------------------------- selftest
-def selftest(out: Path, seed: int = 1) -> bool:
-    """Synthetic 8-orientation data set with known psi; checks recovery."""
+def _write_fake_nanoscope(path: Path, images: dict[str, tuple[np.ndarray, str, str]],
+                          scan: dict[str, str]) -> None:
+    """Write a minimal NanoScope-format file (self-test only; int32 Retrace layers).
+
+    ``images`` maps channel name -> (array in display orientation, soft-scale key,
+    soft-scale unit). Mirrors the layout parsed by :func:`load_nanoscope`.
+    """
+    n_lines, n_samps = next(iter(images.values()))[0].shape
+    data_offset, block = 40960, n_lines * n_samps * 4
+    head = ["\\*File list", "\\Version: 0x09400202", f"\\Data length: {data_offset}",
+            "\\*Ciao scan list"] + [f"\\{k}: {v}" for k, v in scan.items()] + ["\\*Scanner list"]
+    blobs, layers = [], []
+    for i, (name, (img, soft_key, unit)) in enumerate(images.items()):
+        full = max(4.0 * float(np.max(np.abs(img))), 1e-6)
+        head.append(f"\\@{soft_key}: V 1.000000 {unit}/V")
+        raw = np.round(np.flipud(img) / (full / 2**32)).astype("<i4")
+        blobs.append(raw.tobytes())
+        layers += ["\\*Ciao image list", f"\\Data offset: {data_offset + i * block}",
+                   f"\\Data length: {block}", "\\Bytes/pixel: 4", f"\\Samps/line: {n_samps}",
+                   f"\\Number of lines: {n_lines}", "\\Line Direction: Retrace",
+                   f'\\@2:Image Data: S [{name.split()[0]}] "{name}"',
+                   f"\\@2:Z scale: V [{soft_key}] ({full / 2**32:.9g} V/LSB) {full:.9g} V"]
+    text = "\r\n".join(head + layers + ["\\*File list end"]) + "\r\n"
+    header = text.encode("latin-1")
+    if len(header) > data_offset:
+        raise ARPFMError("self-test header too long")
+    path.write_bytes(header + b"\0" * (data_offset - len(header)) + b"".join(blobs))
+
+
+def _selftest_case(out: Path, fmt: str, mirror: bool, seed: int) -> bool:
+    """One synthetic 8-orientation series with known psi; checks recovery."""
     rng = np.random.default_rng(seed)
     out.mkdir(parents=True, exist_ok=True)
     n, big = 160, 240
@@ -782,7 +964,8 @@ def selftest(out: Path, seed: int = 1) -> bool:
     rows = []
     truth_rot, truth_gain = {}, {}
     crop = slice((big - n) // 2, (big + n) // 2)
-    for k, ang in enumerate(angles):
+    store = np.fliplr if mirror else (lambda a: a)  # mirrored image array vs physical frame
+    for ang in angles:
         err = 0.0 if ang == 0 else rng.uniform(-1.5, 1.5)
         rot = ang + err
         gain = 1.0 if ang in (0, 360) else rng.uniform(0.9, 1.1)
@@ -801,33 +984,51 @@ def selftest(out: Path, seed: int = 1) -> bool:
         noise = lambda: rng.normal(scale=0.03, size=(n, n)) + 1j * rng.normal(scale=0.03, size=(n, n))  # noqa: E731
         zl = lat * np.exp(1j * np.deg2rad(phi_inst_l)) + noise()
         zv = vert * np.exp(1j * np.deg2rad(phi_inst_v)) + noise()
-        note = json.dumps({"ScanSize": "5e-06", "ScanPoints": str(n), "ScanLines": str(n),
-                           "ScanAngle": "90", "DriveFrequency": "50000"})
-        name = f"synthetic_A{ang:03d}.npz"
-        np.savez(out / name, HeightRetrace=topo, AmplitudeRetrace=np.abs(zl),
-                 PhaseRetrace=np.rad2deg(np.angle(zl)), VAmplitudeRetrace=np.abs(zv),
-                 VPhaseRetrace=np.rad2deg(np.angle(zv)), __note__=np.array(note))
+        maps = {"h": store(topo), "la": store(np.abs(zl)), "lp": store(np.rad2deg(np.angle(zl))),
+                "va": store(np.abs(zv)), "vp": store(np.rad2deg(np.angle(zv)))}
+        if fmt == "npz":
+            name = f"synthetic_A{ang:03d}.npz"
+            note = json.dumps({"ScanSize": "5e-06", "ScanPoints": str(n), "ScanLines": str(n),
+                               "ScanAngle": "90", "DriveFrequency": "50000"})
+            np.savez(out / name, HeightRetrace=maps["h"], AmplitudeRetrace=maps["la"],
+                     PhaseRetrace=maps["lp"], VAmplitudeRetrace=maps["va"],
+                     VPhaseRetrace=maps["vp"], __note__=np.array(note))
+        else:
+            name = f"synthetic_A{ang:03d}.spm"
+            _write_fake_nanoscope(out / name, {
+                "Height Sensor": (maps["h"], "Sens. ZsensSens", "nm"),
+                "Amplitude": (maps["va"], "Sens. Amplitude", "mV"),
+                "Phase": (maps["vp"], "Sens. Phase", "\u00ba"),
+                "Amplitude 2": (maps["la"], "Sens. Amplitude2", "mV"),
+                "Phase 2": (maps["lp"], "Sens. Phase2", "\u00ba"),
+            }, {"Scan Size": "5 5 ~m", "Rotate Ang.": "90", "Scan Rate": "0.5003"})
         rows.append({"angle_deg": ang, "lpfm_file": name, "vpfm_file": "",
                      "role": "closure" if ang == 360 else "fit"})
     pd.DataFrame(rows).to_csv(out / "manifest.csv", index=False)
 
-    opt = Options("AmplitudeRetrace", "PhaseRetrace", "VAmplitudeRetrace", "VPhaseRetrace",
-                  "HeightRetrace", phi_inst_l, phi_inst_v, handedness=1,
+    names = (("AmplitudeRetrace", "PhaseRetrace", "VAmplitudeRetrace", "VPhaseRetrace",
+              "HeightRetrace") if fmt == "npz" else
+             ("Amplitude 2 Retrace", "Phase 2 Retrace", "Amplitude Retrace", "Phase Retrace",
+              "Height Sensor Retrace"))
+    # Mirroring x maps psi -> 180 - psi, so the physical frame needs h = -1 (offset unchanged).
+    opt = Options(*names, phi_inst_l, phi_inst_v, handedness=-1 if mirror else 1,
                   angle_offset=90.0, fit_gains=True, max_angle_dev=4.0, signal_floor=3.0)
     qc = run(out / "manifest.csv", out / "result", opt)
     with np.load(out / "result" / "ar_pfm_maps.npz") as m:
         psi, mask, theta, gains = m["psi_deg"], m["mask"], m["theta_measured_deg"], m["lat_gains"]
-    truth = psi_true_big[crop, crop]
+    truth = store(psi_true_big[crop, crop])  # physical psi, stored at array positions
     # Exclude pixels within 3 px of a variant boundary (interpolation mixes vectors).
     edge = ndimage.maximum_filter(truth, 7) != ndimage.minimum_filter(truth, 7)
     sel = mask & ~edge
     err = np.abs(wrap_deg(psi[sel] - truth[sel]))
-    rot_err = np.abs(theta - np.array([truth_rot[a] for a in angles[:-1]]))
+    expected_sign = -1 if mirror else 1
+    rot_err = np.abs(theta - expected_sign * np.array([truth_rot[a] for a in angles[:-1]]))
     g_true = np.array([truth_gain[a] for a in angles[:-1]])
     # Compare interpolated orientations only; normalise both to their geometric mean.
     g_fit, g_ref = gains[1:], g_true[1:]
     gain_err = np.abs(g_fit / np.exp(np.mean(np.log(g_fit))) - g_ref / np.exp(np.mean(np.log(g_ref))))
     checks = {
+        "angle sign detected": qc["angle_sign"] == expected_sign,
         "median psi error < 3 deg": float(np.median(err)) < 3,
         "95th pct psi error < 10 deg": float(np.percentile(err, 95)) < 10,
         "rotation error < 0.3 deg": float(rot_err.max()) < 0.3,
@@ -836,12 +1037,19 @@ def selftest(out: Path, seed: int = 1) -> bool:
         and abs(abs(qc["delta_vl_mode_deg"]) - 90) < 10,
         "closure slope 0.9-1.1": 0.9 < qc["closure"][0]["slope"] < 1.1,
     }
-    LOG.info("psi error median %.2f deg, p95 %.2f deg; max rotation error %.3f deg; "
-             "max gain error %.3f", np.median(err), np.percentile(err, 95),
-             rot_err.max(), gain_err.max())
+    LOG.info("[%s%s] psi error median %.2f deg, p95 %.2f deg; max rotation error %.3f deg; "
+             "max gain error %.3f", fmt, ", mirrored" if mirror else "", np.median(err),
+             np.percentile(err, 95), rot_err.max(), gain_err.max())
     for name, ok in checks.items():
-        LOG.info("%-32s %s", name, "PASS" if ok else "FAIL")
+        LOG.info("  %-30s %s", name, "PASS" if ok else "FAIL")
     return all(checks.values())
+
+
+def selftest(out: Path, seed: int = 1) -> bool:
+    """Synthetic end-to-end tests: npz (unmirrored) and NanoScope (mirrored frame)."""
+    ok_npz = _selftest_case(out / "npz", "npz", mirror=False, seed=seed)
+    ok_ns = _selftest_case(out / "nanoscope", "nanoscope", mirror=True, seed=seed)
+    return ok_npz and ok_ns
 
 
 # ------------------------------------------------------------------------ CLI
@@ -872,6 +1080,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="'strong' pixels: |L| > floor x median residual RMS")
     pr.add_argument("--line-flatten", action="store_true",
                     help="line-wise median flatten of Height before registration")
+    pr.add_argument("--angle-sign", choices=("auto", "+1", "-1"), default="auto",
+                    help="image-array rotation sense relative to the manifest angles")
 
     pk = sub.add_parser("calibrate", help="handedness/offset from reference ROIs")
     pk.add_argument("maps", type=Path)
@@ -899,7 +1109,8 @@ def main(argv: list[str] | None = None) -> int:
             opt = Options(args.lat_amp, args.lat_phase, args.vert_amp, args.vert_phase,
                           args.height, args.lat_phase_ref, args.vert_phase_ref,
                           args.handedness, args.angle_offset, args.fit_gains,
-                          args.max_angle_dev, args.signal_floor, args.line_flatten)
+                          args.max_angle_dev, args.signal_floor, args.line_flatten,
+                          0 if args.angle_sign == "auto" else int(args.angle_sign))
             if (opt.vert_amp is None) != (opt.vert_phase is None):
                 raise ARPFMError("--vert-amp and --vert-phase must be given together")
             print(json.dumps(run(args.manifest, args.out, opt), indent=2))
